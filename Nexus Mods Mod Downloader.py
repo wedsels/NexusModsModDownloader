@@ -38,7 +38,7 @@ def goto( url, again = True ):
     def go():
         clear()
         logging.info( f"Navigating: { url }" )
-        page.goto( url )
+        page.goto( url, wait_until="domcontentloaded" )
 
     if again:
         retry( go )
@@ -138,7 +138,7 @@ def id_download( id, fileid, filename = None ):
 
 def api( id, cat = "", fileid = "" ):
     def request():
-        response = session.get( f"https://api.nexusmods.com/v1/games/{ game }/mods/{ id }/files{ f".json?category={ cat }" if fileid == "" else f"/{ fileid }.json" }", headers={ "accept": "application/json", "apikey": apikey } )
+        response = session.get( f"https://api.nexusmods.com/v1/games/{ game }/mods/{ id }/files" f"{ '.json?category=' + cat if fileid == '' else '/' + fileid + '.json' }", headers={ "accept": "application/json", "apikey": apikey } )
         if response.status_code == 200:
             return response.json()
         else:

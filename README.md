@@ -8,7 +8,7 @@
 - Download [ Python ]( https://www.python.org/downloads/ )
   
 2.
-- Download [ Firefox ]( https://www.mozilla.org/en-US/firefox/new/ ) 
+- Download [ Firefox ]( https://www.mozilla.org/en-US/firefox/new/ )
 - Choose a firefox profile to use by typing about:profiles into the address bar
 - Sign in to Nexus Mods with any valid Nexus Mods profile
 - [ Generate an API Key at the bottom of this link ]( https://next.nexusmods.com/settings/api-keys )
