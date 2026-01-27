@@ -222,7 +222,7 @@ if __name__ == "__main__":
         requests = safeimport( "requests" )
         playwright = safeimport( "playwright" )
         playwright_stealth = safeimport( "playwright_stealth" )
-        subprocess.check_call( "playwright install firefox", shell=True )
+        subprocess.check_call( [ sys.executable, "-m", "playwright", "install", "firefox" ] )
         from playwright_stealth import Stealth
         from playwright.sync_api import sync_playwright
 
