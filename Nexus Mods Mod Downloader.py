@@ -47,6 +47,9 @@ def goto( url, again = True ):
 
 def download( event, filename = None ):
     def checkname():
+        nonlocal filename
+        filename = re.sub( r"[\\/:*?\"<>|.]", "", filename )
+
         processedfiles.append( filename )
         if filename in modlist:
             clear()
@@ -68,7 +71,6 @@ def download( event, filename = None ):
 
     if not filename:
         filename = os.path.splitext( file.suggested_filename )[ 0 ]
-    
     processedfiles.append( filename )
 
     if checkname():
@@ -144,7 +146,7 @@ def api( id, cat = "", fileid = "" ):
         else:
             raise Exception( f"Failed to communicate with nexusmods API for mod: { id }:{ fileid }" )
 
-    return retry( request ) 
+    return retry( request )
 
 def main():
     global modit
@@ -191,7 +193,7 @@ def main():
             file = i[ "file" ]
             mod = file[ "mod" ]
             id_download( mod[ "modId" ], i[ "fileId" ], f"{ file[ "name" ] }-{ mod[ "modId" ] }-{ file[ "fileId" ] }-{ mod[ "version" ] }-{ file[ "version" ] }" )
-    
+
     for i in os.listdir( mods ):
         if os.path.splitext( i )[ 0 ] not in processedfiles:
             logger.info( f"File not included, but installed, removing: { i }" )
@@ -247,7 +249,7 @@ if __name__ == "__main__":
 
         while True:
             with open( configs, "r" ) as file:
-                config = json.load( file )
+                config = json.loads( re.sub( r"\\+", "/", file.read() ) )
 
                 hide = config[ "hide" ]
                 if not isinstance( hide, bool ):
@@ -339,9 +341,10 @@ if __name__ == "__main__":
                 logger.info( "Invalid: " + path )
                 continue
 
+            mods = re.sub( r"[\\/:*?\"<>|.]", "", mods )
+
             if not os.path.isdir( mods ):
                 os.mkdir( mods )
-            
             modlist = []
             for i in os.listdir( mods ):
                 modlist.append( os.path.splitext( i )[ 0 ] )
