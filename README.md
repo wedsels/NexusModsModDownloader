@@ -20,7 +20,7 @@
     - [ config.json ]( https://raw.githubusercontent.com/Wedsels/NexusModsModDownloader/refs/heads/main/config.json )
 - Setup config
 - Start Nexus Mods Mod Downloader
-- Either paste the link to a Nexus Mods collection page, or the path a mod list text file
+- Either paste the link to a Nexus Mods collection page, or the path of a mod list text file
 ---
 ### The syntax for mod list text files is as follows\:
 - Game name at the top ( Can be found in the url ex: https://www.nexusmods.com/games/eldenring )
