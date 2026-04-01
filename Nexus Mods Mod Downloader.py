@@ -48,7 +48,7 @@ def goto( url, again = True ):
 def download( event, filename = None ):
     def checkname():
         nonlocal filename
-        filename = re.sub( r"[\\/:*?\"<>|.]", "", filename )
+        filename = re.sub( r"[\\/:*?\"<>|.]", "", filename ).strip()
 
         processedfiles.append( filename )
         if filename in modlist:
@@ -341,7 +341,7 @@ if __name__ == "__main__":
                 logger.info( "Invalid: " + path )
                 continue
 
-            mods = re.sub( r"[\\/:*?\"<>|.]", "", mods )
+            mods = re.sub( r"[\\/:*?\"<>|.]", "", mods ).strip()
 
             if not os.path.isdir( mods ):
                 os.mkdir( mods )
