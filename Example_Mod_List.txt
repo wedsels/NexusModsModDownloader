@@ -1,8 +1,0 @@
-baldursgate3
-16231;
-13824:Fade's Equipment Distribution - FED - SE
-3617:Better Context Menu
-5127;Patch - Vessnelle's Hair Collection by Vessnelle;Patch - Vemperen's Heads by Dufresne12;Patch - Faces of Faerun by Alojia
-3346
-16593
-https://g-6715.modapi.io/v1/games/6715/mods/4636439/files/6306641/download
