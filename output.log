@@ -1,9 +1,0 @@
-06:42:49 [INFO] Starting Nexus Mods downloader
-06:42:56 [INFO] Navigating: https://www.nexusmods.com/games/skyrimspecialedition/collections/oxtos9/mods
-06:42:58 [INFO] Resolved 51 item(s) for game 'skyrimspecialedition' -> C:\repos\NexusModsModDownloader\Verolevi's Animations - All In One
-06:42:58 [INFO] Navigating: https://www.nexusmods.com/skyrimspecialedition/mods/82395?tab=files&file_id=348271
-06:43:00 [INFO] 1/51 | Fetching: Animation Queue Fix-82395-348271-1.0.1-1.0.1.7z
-06:43:01 [INFO] Navigating: https://www.nexusmods.com/skyrimspecialedition/mods/71110?tab=files&file_id=298617
-06:43:02 [INFO] 2/51 | Fetching: Goetia Animations - Alternate Movement For Destruction Staves-71110-298617-1.51-1.51.7z
-06:43:03 [INFO] Navigating: https://www.nexusmods.com/skyrimspecialedition/mods/76388?tab=files&file_id=320841
-06:43:04 [WARNING] Interrupted by user.
