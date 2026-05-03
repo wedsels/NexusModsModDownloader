@@ -57,6 +57,7 @@ LOG_FILE = ROOT / "output.log"
 CRASH_FILE = ROOT / "crash.txt"
 PROFILE_DIR = ROOT / "profile"
 DOWNLOADS_DIR = ROOT / "downloads"
+SCREENSHOTS_DIR = ROOT / "debug_screenshots"
 DEFAULT_CONFIG = ROOT / "config.json"
 
 INVALID_FS_CHARS = re.compile(r'[\\/:*?"<>|]')
@@ -69,6 +70,54 @@ MAX_RETRIES = 5
 RETRY_BACKOFF_SECONDS = 1.0
 DOWNLOAD_CHUNK = 64 * 1024
 MB = 1024 * 1024
+
+# Cookiebot consent banner overlays the viewport and intercepts clicks.
+# We hide it via CSS injected on every page (so it never appears) and also
+# remove the nodes after navigation, in case anything checks `display`.
+COOKIE_BANNER_SELECTORS = (
+    "#CybotCookiebotDialogWrapper",
+    "#CybotCookiebotDialog",
+    "#CybotCookiebotDialogBodyUnderlay",
+)
+_COOKIE_BANNER_CSS = (
+    ", ".join(COOKIE_BANNER_SELECTORS)
+    + " { display: none !important; visibility: hidden !important; "
+      "pointer-events: none !important; }\n"
+    "html, body { overflow: auto !important; }"
+)
+_COOKIE_BANNER_INIT_SCRIPT = f"""
+(() => {{
+  const css = {json.dumps(_COOKIE_BANNER_CSS)};
+  const inject = () => {{
+    if (document.getElementById('__nexus_dl_no_cookiebot__')) return;
+    const style = document.createElement('style');
+    style.id = '__nexus_dl_no_cookiebot__';
+    style.textContent = css;
+    (document.head || document.documentElement).appendChild(style);
+  }};
+  inject();
+  if (document.readyState === 'loading') {{
+    document.addEventListener('DOMContentLoaded', inject, {{ once: true }});
+  }}
+}})();
+"""
+
+# Pre-set a Cookiebot "CookieConsent" cookie so the banner script considers
+# the user to have already responded and skips rendering. Defined as plain
+# fields here for readability; the value is URL-encoded into Cookiebot's
+# expected wire format inside `seed_consent_cookies()`.
+COOKIE_CONSENT_FIELDS: dict[str, Any] = {
+    "stamp": "123",
+    "necessary": True,
+    "preferences": False,
+    "statistics": False,
+    "marketing": False,
+    "method": "explicit",
+    "ver": 1,
+    "utc": int(time.time() * 1000),
+    "region": "aa",
+}
+COOKIE_CONSENT_DOMAINS = (".nexusmods.com", ".next.nexusmods.com")
 
 log = logging.getLogger("nexus")
 
@@ -125,17 +174,12 @@ class Config:
 
 
 def setup_logging() -> None:
-    if LOG_FILE.exists():
-        try:
-            LOG_FILE.unlink()
-        except OSError:
-            pass
-
     log.setLevel(logging.INFO)
     log.handlers.clear()
 
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S")
-    file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    # mode="w" truncates atomically and avoids the unlink race on Windows.
+    file_handler = logging.FileHandler(LOG_FILE, mode="w", encoding="utf-8")
     file_handler.setFormatter(fmt)
     stream_handler = logging.StreamHandler(sys.stdout)
     stream_handler.setFormatter(fmt)
@@ -232,12 +276,15 @@ class NexusDownloader:
         api: NexusAPI,
         page: Page,
         downloads_dir: Path,
+        *,
+        prune: bool = False,
     ) -> None:
         self.config = config
         self.api = api
         self.page = page
         self.session = api.session
         self.downloads_dir = downloads_dir
+        self.prune = prune
         self.processed: set[str] = set()
         self.failed_count = 0
         self.current_index = 0
@@ -245,19 +292,34 @@ class NexusDownloader:
         self.target_dir: Optional[Path] = None
         self.existing_filenames: set[str] = set()
 
-    # -- navigation --------------------------------------------------------
-
     def goto(self, url: str, *, retries: bool = True) -> None:
         def _go() -> None:
             log.info("Navigating: %s", url)
-            self.page.goto(url, wait_until="networkidle", timeout=30_000)
+            # `domcontentloaded` is far more reliable on Nexus than `networkidle`,
+            # which often never settles due to ads/trackers.
+            self.page.goto(url, wait_until="domcontentloaded", timeout=30_000)
 
         if retries:
             retry(_go, label=f"goto {url}")
         else:
             _go()
 
-    # -- file handling -----------------------------------------------------
+    def _dismiss_cookie_banner(self) -> None:
+        """Remove the Cookiebot consent overlay if it slipped past the CSS."""
+        try:
+            self.page.evaluate(
+                """
+                document.getElementById('CybotCookiebotDialogBodyButtonDecline').click();
+                (selectors) => {
+                  for (const sel of selectors) {
+                    document.getElementById(sel).remove();
+                  }
+                }
+                """,
+                list(COOKIE_BANNER_SELECTORS),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.debug("Could not dismiss cookie banner: %s", exc)
 
     def _is_already_downloaded(self, filename_no_ext: str) -> bool:
         if filename_no_ext in self.existing_filenames:
@@ -270,6 +332,23 @@ class NexusDownloader:
             return True
         return False
 
+    def _capture_failure(self, label: str) -> None:
+        """Save a screenshot + page HTML for post-mortem debugging."""
+        try:
+            ensure_dir(SCREENSHOTS_DIR)
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            stem = sanitize_filename(f"{stamp}-{label}") or stamp
+            shot = SCREENSHOTS_DIR / f"{stem}.png"
+            self.page.screenshot(path=str(shot), full_page=True, timeout=10_000)
+            log.info("Saved failure screenshot: %s", shot)
+            try:
+                html = self.page.content()
+                (SCREENSHOTS_DIR / f"{stem}.html").write_text(html, encoding="utf-8")
+            except Exception as exc:  # noqa: BLE001
+                log.debug("Could not save page HTML: %s", exc)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Could not capture failure screenshot: %s", exc)
+
     def _stream_to_disk(self, url: str, dest: Path) -> None:
         existing = dest.stat().st_size if dest.exists() else 0
         headers = {"Range": f"bytes={existing}-"} if existing else {}
@@ -280,6 +359,13 @@ class NexusDownloader:
             raise DownloaderError(
                 f"Failed to download {dest.name}: HTTP {response.status_code}"
             )
+
+        # If we asked for a range but the server returned 200, it ignored the
+        # Range header and is sending the whole file. Append-mode would corrupt
+        # the output, so reset and start over.
+        if existing and response.status_code == 200:
+            log.info("Server ignored Range header for %s; restarting download.", dest.name)
+            existing = 0
 
         total = int(response.headers.get("content-length", 0)) + existing
         mode = "ab" if existing else "wb"
@@ -315,6 +401,7 @@ class NexusDownloader:
                 "Could not trigger download. You may not be logged into Nexus Mods, "
                 "or this mod is not publicly available."
             )
+            self._capture_failure(f"trigger-{preferred_name or 'unknown'}")
             return
 
         download: Download = info.value
@@ -334,14 +421,21 @@ class NexusDownloader:
         filename = stem + suggested_ext
         log.info("%d/%d | Fetching: %s", self.current_index, self.total, filename)
 
-        assert self.target_dir is not None
-        tmp_path = self.downloads_dir / filename
+        if self.target_dir is None:
+            raise DownloaderError("Internal error: target_dir not set before download.")
+        # Stage temp file under a job-specific subfolder so concurrent or
+        # back-to-back jobs don't accidentally resume each other's partial
+        # downloads when filenames collide.
+        tmp_root = self.downloads_dir / self.target_dir.name
+        ensure_dir(tmp_root)
+        tmp_path = tmp_root / filename
         try:
             self._stream_to_disk(download.url, tmp_path)
             shutil.move(str(tmp_path), self.target_dir / filename)
         except DownloaderError as exc:
             self.failed_count += 1
             log.error("%s", exc)
+            self._capture_failure(f"stream-{stem}")
 
     def download_url(self, url: str) -> None:
         if not url or not url.startswith("https://"):
@@ -373,14 +467,27 @@ class NexusDownloader:
         def trigger() -> Any:
             self.goto(target_url)
             with self.page.expect_download() as info:
-                log.debug("Triggering download for %s/%s", mod_id, file_id)
+                log.debug("Triggering download for mod_id %s / file_id %s", mod_id, file_id)
+                # Try multiple strategies because Nexus's web component changes often:
+                #   1. Click the slow-download button inside the shadow root.
+                #   2. Dispatch the legacy `slowDownload` custom event.
+                self._dismiss_cookie_banner()
                 self.page.evaluate(
                     """
                     () => {
                       const el = document.querySelector('mod-file-download');
-                      if (el && el.shadowRoot) {
-                        const btn = el.shadowRoot.querySelector('button.nxm-button-secondary-filled-weak');
-                        if (btn) btn.click();
+                      if (!el) return;
+                      let clicked = false;
+                      if (el.shadowRoot) {
+                        const btn = el.shadowRoot.querySelector(
+                          'button.nxm-button-secondary-filled-weak'
+                        ) || el.shadowRoot.querySelector('button');
+                        if (btn) { btn.click(); clicked = true; }
+                      }
+                      if (!clicked) {
+                        el.dispatchEvent(new CustomEvent('slowDownload', {
+                          bubbles: true, composed: true
+                        }));
                       }
                     }
                     """
@@ -388,8 +495,6 @@ class NexusDownloader:
             return info
 
         self._download_from_event(trigger, preferred_name=preferred_name)
-
-    # -- job runner --------------------------------------------------------
 
     def run_job(self, job: DownloadJob) -> None:
         self.target_dir = job.target_dir
@@ -425,7 +530,23 @@ class NexusDownloader:
                 self.failed_count += 1
                 log.exception("Unhandled error processing item %r: %s", item, exc)
 
-        self._cleanup_orphans(job.target_dir)
+        if self.prune:
+            self._cleanup_orphans(job.target_dir)
+
+    def _cleanup_orphans(self, target_dir: Path) -> None:
+        # Only prune files we plausibly placed here, to reduce the blast radius
+        # if a download fails (so its name never lands in `self.processed`) or
+        # the user has unrelated files in the directory.
+        for path in target_dir.iterdir():
+            if not path.is_file():
+                continue
+            if path.stem in self.processed:
+                continue
+            log.info("Removing orphaned file: %s", path.name)
+            try:
+                path.unlink()
+            except OSError as exc:
+                log.warning("Could not remove %s: %s", path, exc)
 
     def _download_category(
         self,
@@ -449,17 +570,6 @@ class NexusDownloader:
                     if wanted == ALL_MARKER or wanted.lower() == entry["name"].lower():
                         stem = os.path.splitext(entry["file_name"])[0]
                         self.download_by_id(game, str(mod_id), str(entry["file_id"]), stem)
-
-    def _cleanup_orphans(self, target_dir: Path) -> None:
-        for path in target_dir.iterdir():
-            if not path.is_file():
-                continue
-            if path.stem not in self.processed:
-                log.info("Removing orphaned file: %s", path.name)
-                try:
-                    path.unlink()
-                except OSError as exc:
-                    log.warning("Could not remove %s: %s", path, exc)
 
 def parse_text_source(path: Path) -> DownloadJob:
     """Parse a .txt file into a :class:`DownloadJob`."""
@@ -492,9 +602,15 @@ def parse_text_source(path: Path) -> DownloadJob:
         if not main_names and ":" not in main_part:
             main_names = [ALL_MARKER]
 
-        if optional_part != "" or ";" in line:
-            optional_names = [s.strip() for s in optional_part.split(";")]
-            optional_names = [s if s else ALL_MARKER for s in optional_names]
+        # Mirror the original semantics: only promote the *first* empty
+        # optional segment to !All! (so `id;` and `id:;` mean "all optional"),
+        # while `id;Foo;;Bar` keeps the empty middle segment as a no-op rather
+        # than silently downloading every optional file.
+        if ";" in line:
+            optional_raw = [s.strip() for s in optional_part.split(";")]
+            if optional_raw and optional_raw[0] == "":
+                optional_raw[0] = ALL_MARKER
+            optional_names = [s for s in optional_raw if s]
         else:
             optional_names = []
 
@@ -556,21 +672,54 @@ def parse_collection_source(page: Page, downloader_goto: Callable[[str], None], 
     for entry in payload.get("modFiles", []):
         file_info = entry["file"]
         mod_info = file_info["mod"]
+        # `fileId` may live on the entry, the inner file object, or both,
+        # depending on the GraphQL schema version. Prefer whichever exists.
+        file_id = entry.get("fileId") or file_info.get("fileId")
+        if file_id is None:
+            log.warning("Skipping collection entry with no fileId: %r", entry)
+            continue
+        file_version = file_info.get("version", "")
+        mod_version = mod_info.get("version", "")
         name = (
-            f"{file_info['name']}-{mod_info['modId']}-{file_info['fileId']}-"
-            f"{mod_info['version']}-{file_info['version']}"
+            f"{file_info['name']}-{mod_info['modId']}-{file_id}-"
+            f"{mod_version}-{file_version}"
         )
         items.append(
             {
                 "kind": "file_id",
                 "mod_id": str(mod_info["modId"]),
-                "file_id": str(entry["fileId"]),
+                "file_id": str(file_id),
                 "name": name,
             }
         )
 
     target_dir = ROOT / sanitize_filename(title)
     return DownloadJob(game=game, target_dir=target_dir, items=items)
+
+
+BLOCKED_RESOURCE_TYPES = frozenset({"image", "media", "font"})
+
+FIREFOX_PREFS: dict[str, Any] = {
+    # 1 = load all images, 2 = block all images. Skipping image fetches
+    # massively reduces the chance that page.goto() hangs on a slow CDN.
+    "permissions.default.image": 2,
+    # Don't autoplay video/audio either; they can hold the load event open.
+    "media.autoplay.default": 5,
+    "media.autoplay.blocking_policy": 2,
+}
+
+
+def _block_heavy_resources(route: Any) -> None:
+    if route.request.resource_type in BLOCKED_RESOURCE_TYPES:
+        try:
+            route.abort()
+            return
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        route.continue_()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 FIREFOX_PROFILE_FILES = (
@@ -593,6 +742,91 @@ def seed_profile(source: Path, dest: Path) -> None:
             shutil.copytree(src, dst, dirs_exist_ok=True)
         else:
             log.warning("Firefox profile is missing %s (looked in %s)", name, source)
+
+
+def _encode_consent_value(fields: dict[str, Any]) -> str:
+    """Serialize the consent fields into Cookiebot's URL-encoded format.
+
+    Cookiebot writes the cookie as ``{key:value,key:value,...}`` where string
+    values are wrapped in single quotes and booleans/numbers are bare, then
+    the entire blob is percent-encoded (so ``,`` -> ``%2C`` and ``'`` ->
+    ``%27``). The braces themselves are left literal.
+    """
+    from urllib.parse import quote
+
+    def render(value: Any) -> str:
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, (int, float)):
+            return str(value)
+        return f"'{value}'"
+
+    body = ",".join(f"{key}:{render(val)}" for key, val in fields.items())
+    return "{" + quote(body, safe=":{}") + "}"
+
+
+def seed_consent_cookies(context: BrowserContext) -> None:
+    """Pre-populate the Cookiebot consent cookie so the banner never appears.
+
+    Cookiebot checks for a ``CookieConsent`` cookie on load; if present it
+    treats the user as having already responded and short-circuits the
+    banner UI entirely.
+    """
+    expires = int(time.time()) + 365 * 24 * 60 * 60
+    value = _encode_consent_value(COOKIE_CONSENT_FIELDS)
+    cookies: list[Any] = [
+        {
+            "name": "CookieConsent",
+            "value": value,
+            "domain": domain,
+            "path": "/",
+            "expires": expires,
+            "secure": True,
+            "sameSite": "Lax",
+        }
+        for domain in COOKIE_CONSENT_DOMAINS
+    ]
+    try:
+        context.add_cookies(cookies)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Could not seed CookieConsent cookie: %s", exc)
+
+
+def sync_browser_cookies(context: BrowserContext, session: requests.Session) -> None:
+    """Copy browser cookies and a matching User-Agent into ``session``.
+
+    Nexus signs CDN URLs, but some download endpoints still gate on session
+    cookies / UA. Without this the bare ``requests`` session can occasionally
+    receive 403s for content the browser was authorised to fetch.
+    """
+    try:
+        cookies = context.cookies()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Could not read browser cookies: %s", exc)
+        cookies = []
+    for cookie in cookies:
+        name = cookie.get("name")
+        value = cookie.get("value")
+        if not name or value is None:
+            continue
+        try:
+            session.cookies.set(
+                name,
+                value,
+                domain=cookie.get("domain"),
+                path=cookie.get("path", "/"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.debug("Skipping cookie %r: %s", name, exc)
+
+    page = context.pages[0] if context.pages else None
+    if page is not None:
+        try:
+            ua = page.evaluate("() => navigator.userAgent")
+            if ua:
+                session.headers["User-Agent"] = ua
+        except Exception as exc:  # noqa: BLE001
+            log.debug("Could not copy browser User-Agent: %s", exc)
 
 
 def prevent_sleep(enabled: bool) -> None:
@@ -632,7 +866,22 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Exit instead of prompting for input. Requires --source.",
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--prune",
+        action="store_true",
+        help="After a successful run, delete files in the output directory "
+        "that were not part of this job. Off by default to avoid surprising "
+        "deletions when downloads fail.",
+    )
+    parser.add_argument(
+        "--open-on-fail",
+        action="store_true",
+        help="Open the log file in the default viewer when any operation fails.",
+    )
+    args = parser.parse_args(argv)
+    if args.no_prompt and not args.source:
+        parser.error("--no-prompt requires --source.")
+    return args
 
 
 def build_job(
@@ -669,6 +918,9 @@ def run(args: argparse.Namespace) -> int:
     ensure_dir(PROFILE_DIR)
     seed_profile(config.firefox_profile, PROFILE_DIR)
 
+    job: Optional[DownloadJob] = None
+    failed_count = 0
+
     with sync_playwright() as pw:
         context: BrowserContext = pw.firefox.launch_persistent_context(
             str(PROFILE_DIR),
@@ -676,38 +928,67 @@ def run(args: argparse.Namespace) -> int:
             accept_downloads=True,
             downloads_path=str(DOWNLOADS_DIR),
             viewport={"width": 1920, "height": 1080},
+            firefox_user_prefs=FIREFOX_PREFS,
         )
+        # Belt-and-braces: also drop image/font/media requests at the
+        # Playwright layer in case anything bypasses the Firefox pref
+        # (e.g., images fetched via XHR/fetch).
+        try:
+            context.route("**/*", _block_heavy_resources)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Could not install resource blocker: %s", exc)
+        # Inject the cookie-banner CSS *before* any page script runs, so the
+        # banner never gets a chance to render or block the viewport.
+        try:
+            context.add_init_script(_COOKIE_BANNER_INIT_SCRIPT)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Could not install cookie-banner init script: %s", exc)
+        seed_consent_cookies(context)
         try:
             Stealth().apply_stealth_sync(context)
             page = context.pages[0] if context.pages else context.new_page()
-            downloader = NexusDownloader(config, api, page, DOWNLOADS_DIR)
+            downloader = NexusDownloader(
+                config, api, page, DOWNLOADS_DIR, prune=args.prune
+            )
+            sync_browser_cookies(context, downloader.session)
 
             job = _resolve_job(args, page, lambda u: downloader.goto(u))
             if job is None:
                 return 1
 
-            log.info("Resolved %d item(s) for game %r -> %s", len(job.items), job.game, job.target_dir)
+            log.info(
+                "Resolved %d item(s) for game %r -> %s",
+                len(job.items),
+                job.game,
+                job.target_dir,
+            )
 
             prevent_sleep(True)
             try:
                 downloader.run_job(job)
             finally:
                 prevent_sleep(False)
+            failed_count = downloader.failed_count
         finally:
-            context.close()
+            try:
+                context.close()
+            except Exception:  # noqa: BLE001
+                pass
 
-    if downloader.failed_count:
+    if failed_count:
         log.warning(
             "%d operation(s) failed. See %s for details.",
-            downloader.failed_count,
+            failed_count,
             LOG_FILE,
         )
-        _open_path(LOG_FILE)
+        if args.open_on_fail:
+            _open_path(LOG_FILE)
 
-    log.info("Finished. Mods are in %s", job.target_dir)
+    if job is not None:
+        log.info("Finished. Mods are in %s", job.target_dir)
     if not args.no_prompt:
         input("Press Enter to exit...")
-    return 0 if downloader.failed_count == 0 else 1
+    return 0 if failed_count == 0 else 1
 
 
 def _resolve_job(
@@ -725,8 +1006,9 @@ def _resolve_job(
         except DownloaderError as exc:
             log.error("%s", exc)
             if args.no_prompt or args.source:
+                # Non-interactive (or single-shot) callers: bail out.
                 return None
-            args.source = None
+            # Interactive caller: re-prompt by clearing the (already empty) source.
             continue
 
 
@@ -747,8 +1029,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         return run(args)
     except KeyboardInterrupt:
         log.warning("Interrupted by user.")
+        prevent_sleep(False)
         return 130
     except Exception as exc:  # noqa: BLE001 - last resort handler
+        prevent_sleep(False)
         crash = (
             f"Failure: {exc}\n\n{traceback.format_exc()}"
         )
