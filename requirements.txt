@@ -1,0 +1,4 @@
+requests>=2.31
+tqdm>=4.66
+playwright>=1.45
+playwright-stealth>=1.0.6

@@ -1,43 +1,54 @@
-### Automatically download mods from either a collection or mod list text file.
-- Stop and restart mods mid-download with saved progress
-- Rerun script to quickly check for mods missing or needing updates
-- Downloads mod at the maximum speed for the user's account level
-- Does everything silently in the background
----
-1.
-    - Download [ Python ]( https://www.python.org/downloads/ )
-<br></br>
-2.
-    - Download [ Firefox ]( https://www.mozilla.org/en-US/firefox/new/ )
-    - Choose a firefox profile to use by typing about:profiles into the address bar
-    - Sign in to Nexus Mods with any valid Nexus Mods profile
-    - [ Generate an API Key at the bottom of this link ]( https://next.nexusmods.com/settings/api-keys )
-    - Optionally, download a content blocker like UBlock Origin to speed up downloads.
-<br></br>
-3.
-    - Install the files
-        - [ Nexus Mods Mod Downloader.py ]( https://raw.githubusercontent.com/Wedsels/NexusModsModDownloader/refs/heads/main/Nexus%20Mods%20Mod%20Downloader.py )
-        - [ config.json ]( https://raw.githubusercontent.com/Wedsels/NexusModsModDownloader/refs/heads/main/config.json )
-    - Setup config
-    - Start Nexus Mods Mod Downloader
-    - Either paste the link to a Nexus Mods collection page, or the path of a mod list text file
----
-### The syntax for mod list text files is as follows\:
-- Game name at the top ( Can be found in the url ex: https://www.nexusmods.com/games/eldenring )
-    - eldenring
-- Download all the main files for this mod id
-    - 88943
-- Download only the main file which matches this name
-    - 88943:Textures 4k
-- Download the matching main files
-    - 88943:Textures 4k:Textures Essentials
-- Download all the main files and these optional files
-    - 88943;Textures LOD;Textures Addon
-- Download only this optional file
-    - 88943:;Textures Optional Grass
-- Download all main files and all optional files
-    - 88943;
-- Download only all optional files
-    - 88943:;
-- Download the file at this link ( A link which leads directly to a download )
-    - https://I.Am.A.Direct.Download.Link/file/1234/download
+# Nexus Mods Mod Downloader
+
+A batch downloader for Nexus Mods that supports both Nexus collection URLs and
+plain text manifest files.
+
+## Setup
+
+```sh
+pip install -r requirements.txt
+python -m playwright install firefox
+```
+
+Rename `config.json.example` to `config.json` and fill in:
+
+- `apikey` – your personal Nexus Mods API key (https://www.nexusmods.com/users/myaccount?tab=api)
+- `firefox` – path to a Firefox profile that is logged in to Nexus Mods.
+  Cookies, extensions and extension settings will be copied from this profile
+  into a sandbox under `./profile/` on each run.
+- `hide` – `true` to run Firefox headless, `false` to show the window.
+
+## Usage
+
+Interactive mode:
+
+```sh
+python nexus_downloader.py
+```
+
+Non-interactive:
+
+```sh
+python nexus_downloader.py --source "https://www.nexusmods.com/games/<game>/collections/<id>"
+python nexus_downloader.py --source ./mylist.txt --no-prompt
+```
+
+## Text manifest format
+
+```
+<gameDomain>
+<modId>[:mainName1:mainName2...][;optionalName1;optionalName2...]
+https://www.nexusmods.com/.../some/direct/link
+# Comments start with '#' and are ignored.
+```
+
+- Use the literal `!All!` (or leave the segment empty after `;`) to grab every
+  file in that category.
+- The first line must be the Nexus game domain (e.g. `skyrimspecialedition`).
+
+## Output
+
+- Mods are placed in a folder named after the source (collection title or
+  manifest filename) next to the script.
+- Logs are written to `output.log`. On unhandled crashes a `crash.txt` is
+  produced and opened automatically.
