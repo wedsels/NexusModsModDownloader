@@ -26,9 +26,9 @@ def retry( func, *args, **kwargs ):
         try:
             return func( *args, **kwargs )
         except Exception as e:
-            logger.info( f"{ str( e ) }\nFailed attempt { attempt + 1 }/{ tries }" )
+            logger.warning(f"Attempt {attempt + 1}/{tries} failed: {e}")
             time.sleep( 1 + attempt )
-
+    logger.error("All retry attempts failed.")
     global failed
     failed = True
 
@@ -46,6 +46,7 @@ def goto( url, again = True ):
         go()
 
 def download( event, filename = None ):
+    global failed
     def checkname():
         nonlocal filename
         filename = re.sub( r"[\\/:*?\"<>|.]", "", filename ).strip()
@@ -60,18 +61,23 @@ def download( event, filename = None ):
     if filename and checkname():
         return
 
-    ret = retry( event )
+    
+    ret = retry(event)
+
     if not ret:
-        if filename != None:
-            logger.info( "You may not be logged into nexus mods\nOr this specific mod is not publicly visible" )
+        logger.error(f"Failed to obtain download event for: {filename or 'unknown file'}")
+        if filename is not None:
+            logger.error(
+                "The mod may be inaccessible, or you may not be logged into Nexus Mods."
+            )
         return
+
 
     file = ret.value
     file.cancel()
 
     if not filename:
         filename = os.path.splitext( file.suggested_filename )[ 0 ]
-    processedfiles.append( filename )
 
     if checkname():
         return
@@ -87,25 +93,38 @@ def download( event, filename = None ):
 
     response = session.get( file.url, allow_redirects=True, stream=True, timeout=30, headers={ "Range": f"bytes={ existing_file_size }-" } if existing_file_size > 0 else {} )
 
-    if response.status_code not in ( 200, 206 ):
-        logger.info( f"Failed to fetch { filename }\nStatus: { response.status_code }" )
+    if response.status_code not in (200, 206):
+        logger.error(
+            f"HTTP download failed for {filename}. "
+            f"Status code: {response.status_code}"
+        )
+        response.close()
+        failed = True
         return
 
     mb = 1024 * 1024
 
-    with open( path, "ab" if existing_file_size > 0 else "wb" ) as f:
+
+    resume = existing_file_size > 0 and response.status_code == 206
+    start_size = existing_file_size if resume else 0
+
+    with open(path, "ab" if resume else "wb") as f:
         with tqdm.tqdm(
-            total=( int( response.headers.get( "content-length", 0 ) ) + existing_file_size ) / mb,
-            initial=existing_file_size / mb,
+            total=(
+                int(response.headers.get("content-length", 0)) + start_size
+            ) / mb,
+            initial=start_size / mb,
             unit="MB",
             bar_format="{l_bar}{bar}| {n:.1f}/{total:.1f} {unit} {rate_fmt} {remaining}"
         ) as pbar:
-            for chunk in response.iter_content( chunk_size=64 * 1024 ):
+            for chunk in response.iter_content(chunk_size=64 * 1024):
                 if chunk:
-                    f.write( chunk )
-                    pbar.update( len( chunk ) / mb )
+                    f.write(chunk)
+                    pbar.update(len(chunk) / mb)
 
-    shutil.move( path, os.path.join( mods, filename ) )
+    response.close()
+    shutil.move(path, os.path.join(mods, filename))
+    logger.info(f"Successfully downloaded: {filename}")
 
 def url_download( url ):
     if not url or not url.startswith( "https://" ):
@@ -118,25 +137,39 @@ def url_download( url ):
             except:
                 pass
             return info
-
     retry( download, down )
 
 def id_download( id, fileid, filename = None ):
+    
     def down():
-        goto( f"https://www.nexusmods.com/{ game }/mods/{ id }?tab=files&file_id={ fileid }" )
+        goto(
+            f"https://www.nexusmods.com/{game}/mods/{id}?tab=files&file_id={fileid}"
+        )
 
-        with page.expect_download() as info:
-            page.evaluate(
-                """
-                const modComponent = document.querySelector( 'mod-file-download' );
-                if ( modComponent )
-                    modComponent.dispatchEvent( new CustomEvent( 'slowDownload', { bubbles: true, composed: true } ) );
-                """
-            )
+        with page.expect_download(timeout=60000) as info:
+            page.locator("mod-file-download").evaluate("""
+                comp => {
+                    const root = comp.shadowRoot;
+                    const button = Array.from(
+                        root.querySelectorAll('button, a')
+                    ).find(el =>
+                        (el.innerText || el.textContent || '')
+                            .trim().toLowerCase() === 'slow download'
+                    );
 
+                    if (!button) {
+                        throw new Error('Slow download button not found');
+                    }
+
+                    button.click();
+                }
+            """)
+
+        logger.info("Download event captured successfully")
         return info
 
-    retry( download, down, filename )
+    retry(download, down, filename)
+
 
 def api( id, cat = "", fileid = "" ):
     def request():
@@ -149,7 +182,7 @@ def api( id, cat = "", fileid = "" ):
     return retry( request )
 
 def main():
-    global modit
+    global modit, ln
 
     if path.endswith( ".txt" ):
         for line in data:
@@ -184,21 +217,211 @@ def main():
             files( main, "main" )
             files( optional, "optional" )
             files( optional, "update" )
-    elif path.startswith( "https://" ):
-        for i in data[ "externalResources" ]:
-            modit += 1
-            url_download( i[ "resourceUrl" ] )
-        for i in data[ "modFiles" ]:
-            modit += 1
-            file = i[ "file" ]
-            mod = file[ "mod" ]
-            id_download( mod[ "modId" ], i[ "fileId" ], f"{ file[ "name" ] }-{ mod[ "modId" ] }-{ file[ "fileId" ] }-{ mod[ "version" ] }-{ file[ "version" ] }" )
+            
 
-    for i in os.listdir( mods ):
-        if os.path.splitext( i )[ 0 ] not in processedfiles:
-            logger.info( f"File not included, but installed, removing: { i }" )
-            if os.path.exists( mods + i ):
-                os.remove( mods + i )
+    elif path.startswith("https://"):
+        external_resources = data.get("externalResources", [])
+        required_mods = []
+        optional_mods = []
+
+        for item in data["modFiles"]:
+            if item.get("optional", False):
+                optional_mods.append(item)
+            else:
+                required_mods.append(item)
+        logger.info("Collection information processed successfully.")
+        logger.info(
+            f"Found {len(required_mods)} required mods, "
+            f"{len(optional_mods)} optional mods, "
+            f"and {len(external_resources)} external resources."
+)
+        # Step 1: Handle off-site assets before downloading mods
+        if external_resources:
+            while True:
+                print("\n========== OFF-SITE ASSETS DETECTED ==========")
+                print("These resources may require manual downloads.\n")
+
+                for index, resource in enumerate(external_resources, start=1):
+                    print(f"{index}. {resource.get('name', 'External resource')}")
+                    print(f"   URL: {resource.get('resourceUrl', 'No URL available')}")
+
+                print("\n1. Open external resource links")
+                print("2. Skip external assets and continue")
+                print("3. Exit downloader")
+
+                choice = input("Choose an option (1-3): ").strip()
+
+                if choice == "1":
+                    logger.info("Opening external resource links in the browser.")
+                    for resource in external_resources:
+                        url = resource.get("resourceUrl")
+                        if url:
+                            webbrowser.open(url)
+
+                    input(
+                        "\nHandle the downloads in your browser, "
+                        "then press Enter to return to this prompt..."
+                    )
+
+                elif choice == "2":
+                    logger.info("User chose to skip external resources.")
+                    print("Skipping external assets.")
+                    break
+
+                elif choice == "3":
+                    print("Exiting the downloader.")
+                    logger.info("User exited from the external-resource prompt.")
+                    return
+
+                else:
+                    print("Invalid option. Please choose 1, 2 or 3.")
+        # Step 2: Main collection menu
+        while True:
+            print("\n========== COLLECTION DOWNLOADER ==========")
+            print(f"Required mods: {len(required_mods)}")
+            print(f"Optional mods available: {len(optional_mods)}")
+            print("\n1. Download all required mods")
+            print("2. View and select optional mods")
+            print("3. Download ALL optional mods")
+            print("4. Skip optional mods")
+            print("5. Exit")
+            print("============================================")
+
+            choice = input("Choose an option (1-5): ").strip()
+
+            # Option 1: Required mods
+            if choice == "1":
+                if not required_mods:
+                    print("\nNo required mods found.")
+                    continue
+
+                ln = len(required_mods)
+                modit = 0
+
+                print(f"\nDownloading {len(required_mods)} required mod(s)...")
+                logger.info(f"Starting download batch: {len(required_mods)} required mods.")
+
+                for item in required_mods:
+                    modit += 1
+                    file = item["file"]
+                    logger.info(f"Processing required mod: {file['name']}")
+                    mod = file["mod"]
+
+                    id_download(
+                        mod["modId"],
+                        item["fileId"],
+                        f"{file['name']}-{mod['modId']}-{item['fileId']}-{mod['version']}-{file['version']}"
+                    )
+
+                print("\nRequired mod downloads complete!")
+
+            # Option 2: Select specific optional mods
+            elif choice == "2":
+                if not optional_mods:
+                    print("\nNo optional mods are available.")
+                    continue
+
+                print("\nAvailable optional mods:")
+
+                for index, item in enumerate(optional_mods, start=1):
+                    file = item["file"]
+                    print(f"{index}. {file['name']} (v{file['version']})")
+
+                print("\nSelection guide:")
+                print("  1,2,4 - Download mods 1, 2 and 4")
+                print("  A     - Download all optional mods")
+                print("  S     - Return to the main menu")
+
+                selection = input("\nEnter your selection: ").strip().upper()
+
+                if selection == "S" or not selection:
+                    continue
+
+                if selection == "A":
+                    selected_mods = optional_mods.copy()
+                else:
+                    try:
+                        indexes = {
+                            int(value.strip())
+                            for value in selection.split(",")
+                        }
+
+                        if any(
+                            index < 1 or index > len(optional_mods)
+                            for index in indexes
+                        ):
+                            raise ValueError
+
+                        selected_mods = [
+                            optional_mods[index - 1]
+                            for index in sorted(indexes)
+                        ]
+
+                    except ValueError:
+                        print("\nInvalid selection. No mods selected.")
+                        continue
+
+                ln = len(selected_mods)
+                logger.info(f"User selected {len(selected_mods)} optional mod(s).")
+                modit = 0
+
+                print(f"\nDownloading {len(selected_mods)} optional mod(s)...")
+
+                for item in selected_mods:
+                    modit += 1
+                    file = item["file"]
+                    logger.info(f"Processing optional mod: {file['name']}")
+                    mod = file["mod"]
+
+                    id_download(
+                        mod["modId"],
+                        item["fileId"],
+                        f"{file['name']}-{mod['modId']}-{item['fileId']}-{mod['version']}-{file['version']}"
+                    )
+
+                print("\nSelected optional downloads complete!")
+
+            # Option 3: Download all optional mods
+            elif choice == "3":
+                if not optional_mods:
+                    print("\nNo optional mods are available.")
+                    continue
+
+                ln = len(optional_mods)
+                modit = 0
+
+                print(f"\nDownloading all {len(optional_mods)} optional mod(s)...")
+                logger.info(f"Starting download batch: {len(optional_mods)} optional mods.")
+                for item in optional_mods:
+                    modit += 1
+                    file = item["file"]
+                    logger.info(f"Processing optional mod: {file['name']}")
+                    mod = file["mod"]
+
+                    id_download(
+                        mod["modId"],
+                        item["fileId"],
+                        f"{file['name']}-{mod['modId']}-{item['fileId']}-{mod['version']}-{file['version']}"
+                    )
+
+                print("\nAll optional downloads complete!")
+
+            # Option 4: Exit
+            elif choice == "4":
+                print("\nSkipping optional mods.")
+                print("Collection download workflow complete.")
+                return
+
+            elif choice == "5":
+                print("\nExiting the collection downloader.")
+                return
+
+            else:
+                print("\nInvalid option. Please choose 1, 2, 3, 4 or 5.")
+
+# Cleanup disabled for now to prevent accidental deletion of files.
+# We can implement safe cleanup once downloaded files are tracked correctly.
+
 
 def safeimport( package ):
     subprocess.check_call( [ sys.executable, "-m", "pip", "install", "--upgrade", package ] )
@@ -217,6 +440,7 @@ if __name__ == "__main__":
         import logging
         import traceback
         import subprocess
+        import webbrowser
 
         os.system( "mode con: cols=140 lines=3" )
 
@@ -309,28 +533,40 @@ if __name__ == "__main__":
                 try:
                     if not path.endswith( "/mods" ):
                         path = path + "/mods"
+                        
+                    logger.info("Waiting for CollectionRevisionMods response...")
 
-                    with page.expect_response( lambda r: r.request.headers.get( "x-graphql-operationname" ) == "CollectionRevisionMods" and r.status == 200 ) as response_info:
+                    with page.expect_response( lambda r: r.request.headers.get( "x-graphql-operationname" ) == "CollectionRevisionMods" and r.status == 200, timeout = 30000 ) as response_info:
                         goto( path )
-
+                    logger.info("Collection response captured!")
                     response = response_info.value
 
                     if response.status == 200:
-                            mods = f"./{ page.text_content( ".typography-heading-md.sm\\:typography-heading-lg.text-neutral-strong.break-words.font-semibold" ) }/"
+                            # mods = f"./{ page.text_content( ".typography-heading-md.sm\\:typography-heading-lg.text-neutral-strong.break-words.font-semibold" ) }/"
+                            mods = f"./{page.locator('h1').first.inner_text()}/"
+                            
+
                             data = response.json()[ "data" ][ "collectionRevision" ]
                             ln = len( data[ "externalResources" ] ) + len( data[ "modFiles" ] )
                             game = re.search( r'/games/([^/]+)/', path ).group( 1 )
-                except Exception as e:
-                    clear()
-                    logger.info( f"{ str( e ) }\nFailed to parse collection: { path }" )
+                except Exception:
+                    logger.exception(f"Failed to parse collection: {path}")
+                    input("Press Enter to continue...")
                     continue
             elif os.path.isfile( path ) and path.endswith( ".txt" ):
                 mods = f"./{ os.path.splitext( os.path.basename( path ) )[ 0 ] }/"
-                with open( path, "r" ) as file:
+                
+                with open(path, "r") as file:
                     data = file.readlines()
-                    game = data[ 0 ].strip()
-                    data = data[ 1: ]
-                    ln = len( data )
+
+                if not data or not data[0].strip():
+                    logger.error(f"Empty file or missing game name: {path}")
+                    continue
+
+                game = data[0].strip()
+                data = data[1:]
+                ln = len(data)
+
             else:
                 clear()
                 logger.info( "Invalid: " + path )

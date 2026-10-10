@@ -1,1 +1,24 @@
-.vscode
+
+# Editor settings
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# Secrets and local configuration
+config.json
+
+# Browser session data
+profile/
+
+# Downloaded mods and generated folders
+downloads/
+FallUI Series/
+QoL & Extras/
+
+# Logs and crash reports
+output.log
+crash.txt
