@@ -18,14 +18,16 @@ Wabbajack-specific behaviour (all optional):
   * Cached archives are detected and skipped before any browser navigation.
   * Downloads are written to ``<name>.part`` and resumed with HTTP Range;
     a truncated or corrupt stream is never promoted into the final cache.
-  * ``expected_sizes.json`` (optional, written by tools/wabbajack_converter.py)
-    is used to verify the final byte count against the Wabbajack manifest.
+  * ``expected_sizes.json`` and ``expected_hashes.json`` (optional, written by
+    tools/wabbajack_converter.py) validate the final byte count and Wabbajack
+    xxHash64 before a finished archive enters the cache.
   * ``NMMD_MODS_DIR`` can point finished archives at an existing mod cache.
   * Unlike upstream, unrecognised files in the output folder are NEVER deleted.
 
 Based on https://github.com/wedsels/NexusModsModDownloader (no upstream license).
 """
 
+import base64
 import ctypes
 import json
 import logging
@@ -37,9 +39,11 @@ import subprocess
 import sys
 import time
 import traceback
+from datetime import datetime
 from pathlib import Path
 
 import requests
+import xxhash
 from playwright.sync_api import sync_playwright
 from playwright_stealth import Stealth
 from tqdm import tqdm
@@ -50,13 +54,16 @@ LOG_PATH = BASE / "output.log"
 CRASH_PATH = BASE / "crash.txt"
 STATUS_PATH = BASE / "download_status.json"
 EXPECTED_SIZES_PATH = BASE / "expected_sizes.json"
+EXPECTED_HASHES_PATH = BASE / "expected_hashes.json"
 PROFILE_DIR = BASE / "profile"
 DOWNLOAD_DIR = BASE / "downloads"
+QUARANTINE_DIR = BASE / "quarantine"
 
 all = "!All!"
 
-# Scrubbed base name -> exact byte count, loaded from expected_sizes.json.
+# Scrubbed base name -> exact byte count / Wabbajack xxHash64 (base64).
 EXPECTED_SIZES = {}
+EXPECTED_HASHES = {}
 
 logger = logging.getLogger("NMMD")
 modit = 0
@@ -111,8 +118,36 @@ def goto(url, again=True):
 
 
 def scrub(name):
-    """Match the filename normalisation used for cache/size lookups."""
+    """Match the filename normalisation used for cache/size/hash lookups."""
     return re.sub(r'[\\/:*?"<>|.]', "", name).strip()
+
+
+def xxhash_b64(hasher):
+    """Wabbajack encodes xxHash64 as base64 of its little-endian bytes."""
+    return base64.b64encode(hasher.intdigest().to_bytes(8, "little")).decode("ascii")
+
+
+def hash_stream(path):
+    h = xxhash.xxh64()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(4 * 1024 * 1024), b""):
+            h.update(chunk)
+    return h
+
+
+def hash_file(path):
+    return xxhash_b64(hash_stream(path))
+
+
+def quarantine(path, reason):
+    """Preserve a bad file for inspection instead of silently deleting it."""
+    QUARANTINE_DIR.mkdir(parents=True, exist_ok=True)
+    target = QUARANTINE_DIR / f"{Path(path).name}.{datetime.now():%Y%m%d-%H%M%S}"
+    try:
+        shutil.move(path, target)
+        logger.info("Quarantined %s -> %s (%s)", path, target, reason)
+    except Exception as exc:
+        logger.info("Could not quarantine %s: %s", path, exc)
 
 
 def download(event, filename=None):
@@ -160,14 +195,34 @@ def download(event, filename=None):
             pass
 
     existing = os.path.getsize(part) if os.path.exists(part) else 0
-    expected = EXPECTED_SIZES.get(scrub(os.path.splitext(filename)[0]))
+    key = scrub(os.path.splitext(filename)[0])
+    expected = EXPECTED_SIZES.get(key)
+    expected_hash = EXPECTED_HASHES.get(key)
 
     if expected and existing >= expected:
         if existing == expected:
+            if expected_hash:
+                got = hash_file(part)
+                if got != expected_hash:
+                    logger.info("Hash mismatch for complete partial %s: got %s, expected %s",
+                                filename, got, expected_hash)
+                    quarantine(part, "xxHash64 mismatch")
+                    raise Exception(f"hash mismatch for {filename}")
             shutil.move(part, os.path.join(mods, filename))
             return
         logger.info("Partial for %s is oversized (%d > %d); leaving it untouched", filename, existing, expected)
         return
+
+    # Seed the hasher with bytes already on disk so a resumed download is
+    # verified over the WHOLE archive, not just the newly fetched tail.
+    hasher = xxhash.xxh64()
+    if expected_hash and existing > 0:
+        try:
+            hasher = hash_stream(part)
+        except Exception as exc:
+            logger.info("Could not hash existing partial for %s: %s", filename, exc)
+            quarantine(part, "unreadable partial")
+            raise
 
     headers = {"Range": f"bytes={existing}-"} if existing > 0 else {}
     response = session.get(file.url, allow_redirects=True, stream=True, timeout=60, headers=headers)
@@ -201,6 +256,8 @@ def download(event, filename=None):
                 for chunk in response.iter_content(chunk_size=64 * 1024):
                     if chunk:
                         f.write(chunk)
+                        if expected_hash:
+                            hasher.update(chunk)
                         written += len(chunk)
                         pbar.update(len(chunk) / mb)
             f.flush()
@@ -220,6 +277,14 @@ def download(event, filename=None):
         logger.info("Size mismatch for %s: got %d, expected %d. Partial kept for resume.",
                     filename, final_size, expected)
         return
+
+    if expected_hash:
+        got = xxhash_b64(hasher)
+        if got != expected_hash:
+            logger.info("Hash mismatch for %s: got %s, expected %s. Refetching from a fresh URL.",
+                        filename, got, expected_hash)
+            quarantine(part, "xxHash64 mismatch")
+            raise Exception(f"hash mismatch for {filename}")
 
     shutil.move(part, os.path.join(mods, filename))
 
@@ -446,6 +511,13 @@ def run():
             logger.info("Loaded %d expected archive sizes", len(EXPECTED_SIZES))
         except Exception as e:
             logger.info("Could not load expected_sizes.json: %s", e)
+
+    if EXPECTED_HASHES_PATH.is_file():
+        try:
+            EXPECTED_HASHES.update(json.loads(EXPECTED_HASHES_PATH.read_text(encoding="utf-8")))
+            logger.info("Loaded %d expected Wabbajack hashes", len(EXPECTED_HASHES))
+        except Exception as e:
+            logger.info("Could not load expected_hashes.json: %s", e)
 
     logger.info("Setting up...")
     hide, apikey, firefox = load_config()

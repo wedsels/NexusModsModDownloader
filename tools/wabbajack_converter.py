@@ -7,7 +7,8 @@ Convert a Wabbajack ``modlist.txt`` (Archives JSON) into the downloader's
 
 Outputs (next to this repo by default, override with positional arguments):
     download_list.txt     first line = Nexus game domain, then one entry per line
-    expected_sizes.json   scrubbed archive name -> byte size, used to validate resumes
+    expected_sizes.json   scrubbed archive name -> byte size
+    expected_hashes.json  scrubbed archive name -> Wabbajack xxHash64 (base64)
 
 The game domain is auto-detected from the first archive's ``gameName``. Use
 ``--game DOMAIN`` to override (e.g. ``--game skyrimspecialedition``).
@@ -63,6 +64,7 @@ def main():
     parser.add_argument("input", type=Path, help="Wabbajack modlist.txt (Archives JSON)")
     parser.add_argument("output", type=Path, nargs="?", default=BASE / "download_list.txt")
     parser.add_argument("sizes", type=Path, nargs="?", default=BASE / "expected_sizes.json")
+    parser.add_argument("hashes", type=Path, nargs="?", default=BASE / "expected_hashes.json")
     parser.add_argument("--game", help="override Nexus game domain")
     args = parser.parse_args()
 
@@ -70,6 +72,7 @@ def main():
     archives = data.get("Archives", [])
     pairs = {}
     sizes = {}
+    hashes = {}
     skipped = 0
     detected_game = None
 
@@ -84,10 +87,14 @@ def main():
         key = scrub(os.path.splitext(name)[0])
         if key and archive.get("Size"):
             sizes[key] = int(archive["Size"])
+        # Wabbajack's Hash is base64(xxHash64(file), little-endian 8 bytes).
+        if key and archive.get("Hash"):
+            hashes[key] = archive["Hash"]
 
     game = args.game or GAME_MAP.get((detected_game or "").lower(), detected_game or "skyrimspecialedition")
 
     args.sizes.write_text(json.dumps(sizes, indent=1, sort_keys=True), encoding="utf-8")
+    args.hashes.write_text(json.dumps(hashes, indent=1, sort_keys=True), encoding="utf-8")
     with args.output.open("w", encoding="utf-8", newline="\n") as f:
         f.write(game + "\n")
         for (mod_id, file_id), name in sorted(pairs.items()):
@@ -99,6 +106,7 @@ def main():
     print(f"  Download lines written     : {len(pairs)}")
     print(f"  Output                     : {args.output}")
     print(f"  Expected sizes             : {args.sizes} ({len(sizes)} entries)")
+    print(f"  Expected Wabbajack hashes  : {args.hashes} ({len(hashes)} entries)")
     print(f"  Game domain                : {game}")
 
 

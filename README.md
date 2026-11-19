@@ -71,10 +71,30 @@ Convert the Wabbajack `modlist.txt` (Archives JSON) first:
 python tools\wabbajack_converter.py C:\path\to\Wabbajack\modlist.txt
 ```
 
-This writes `download_list.txt` (game domain + exact entries) and
-`expected_sizes.json` in the repo root. Then either paste
-`download_list.txt` into the downloader, or run the optional unattended
-runner:
+This writes `download_list.txt` (game domain + exact entries),
+`expected_sizes.json` and `expected_hashes.json` in the repo root. Wabbajack's
+`Hash` field is base64-encoded xxHash64 (little-endian 8 bytes); it is a fast
+integrity checksum, not a cryptographic signature.
+
+The downloader hashes every chunk while it writes the `.part`, then requires
+**both** the exact size and hash to match before promoting a file into the
+cache. A mismatch quarantines the partial and refetches from a fresh CDN URL,
+so an interrupted download can never silently leave a corrupt archive.
+
+To audit archives that are already cached (e.g. copied from a previous
+Wabbajack run), check them without changing anything:
+
+```bat
+python tools\verify_cache.py
+```
+
+It records verified files in `verified_cache.json` keyed by size and mtime, so
+repeat runs only re-hash changed files. Add `--quarantine` to move mismatched
+files into `quarantine/` for redownload. xxHash runs at roughly 1 GB/s here,
+so a full audit of several hundred GB takes minutes, not hours.
+
+Then either paste `download_list.txt` into the downloader, or run the optional
+unattended runner:
 
 ```bat
 tools\start_supervisor.bat
