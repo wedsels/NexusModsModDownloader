@@ -1,1 +1,24 @@
-.vscode
+# Runtime state (never commit: contains cookies, keys, partials or personal paths)
+profile/
+downloads/
+*.part
+*.log
+download_status.json
+verified_cache.json
+quarantine/
+crash.txt
+config.local.json
+NO_LOG_WINDOW
+
+# Generated from a Wabbajack modlist (may contain a user's private list)
+download_list.txt
+expected_sizes.json
+expected_hashes.json
+masterstroke.txt
+modlist.txt
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
